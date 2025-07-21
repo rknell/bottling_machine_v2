@@ -55,7 +55,7 @@ void setup()
   Serial.println("Pin setup complete");
 }
 
-float _getDistance(int triggerPin, int echoPin)
+float _getRawUltrasonicSensorReading(int triggerPin, int echoPin)
 {
   digitalWrite(triggerPin, HIGH);
   delayMicroseconds(10);
@@ -63,63 +63,86 @@ float _getDistance(int triggerPin, int echoPin)
   return pulseIn(echoPin, HIGH);
 }
 
-float getBottleDistanceReadings[10] = {0};
-float getBottleDistance()
+// 🎯 UNIVERSAL SENSOR BUFFER SYSTEM: Map-like structure for per-pin rolling averages
+struct SensorBuffer
 {
-  // 🎯 ROLLING AVERAGE BUFFER: Store last 10 readings for noise elimination
-  static int readingIndex = 0;
-  static int totalReadingCount = 0;
+  float readings[10];
+  int readingIndex;
+  int totalReadingCount;
+};
 
-  // 📡 SENSOR RECONNAISSANCE: Get raw distance measurement
-  float rawDistance = _getDistance(triggerPinBottle, echoPinBottle);
+// 🏛️ SENSOR BUFFER REGISTRY: Static storage for multiple sensor buffers
+static SensorBuffer sensorBuffers[10]; // Support up to 10 different trigger pins
+static int registeredPins[10];         // Track which pins are registered
+static int bufferCount = 0;            // Number of registered buffers
 
-  // 💾 TACTICAL DATA STORAGE: Always store reading in circular buffer (including zeros)
-  getBottleDistanceReadings[readingIndex] = rawDistance;
-  readingIndex = (readingIndex + 1) % 10;
-  totalReadingCount++;
-
-  // 🎯 INITIALIZATION PROTOCOL: Return default for first 10 readings
-  if (totalReadingCount < 10)
+// 🔍 BUFFER RECONNAISSANCE: Find or create buffer for specific trigger pin
+SensorBuffer *_getSensorBuffer(int triggerPin)
+{
+  // 🎯 EXISTING BUFFER SEARCH: Check if pin already registered
+  for (int i = 0; i < bufferCount; i++)
   {
-    return 1000; // 🛡️ BUFFER WARMING: Return safe default until buffer full
+    if (registeredPins[i] == triggerPin)
+    {
+      return &sensorBuffers[i];
+    }
   }
 
-  // ⚡ MEAN CALCULATION: Return average of last 10 readings
-  return _calculateMean(getBottleDistanceReadings, 10);
+  // 🚀 NEW BUFFER CREATION: Register new pin if space available
+  if (bufferCount < 10)
+  {
+    registeredPins[bufferCount] = triggerPin;
+    SensorBuffer *newBuffer = &sensorBuffers[bufferCount];
+    // 🛡️ BUFFER INITIALIZATION: Zero out new buffer
+    for (int i = 0; i < 10; i++)
+    {
+      newBuffer->readings[i] = 0;
+    }
+    newBuffer->readingIndex = 0;
+    newBuffer->totalReadingCount = 0;
+    bufferCount++;
+    return newBuffer;
+  }
+
+  // 💀 BUFFER OVERFLOW PROTECTION: Return first buffer as fallback
+  return &sensorBuffers[0];
 }
 
-float getCapDistanceReadings[10] = {0};
-float _getCapDistance(int triggerPin, int echoPin)
+float _getUltrasonicSensorDistance(int triggerPin, int echoPin)
 {
-  // 🎯 ROLLING AVERAGE BUFFER: Store last 10 readings for noise elimination
-  static int readingIndex = 0;
-  static int totalReadingCount = 0;
+  // 🎯 BUFFER ACQUISITION: Get dedicated buffer for this trigger pin
+  SensorBuffer *buffer = _getSensorBuffer(triggerPin);
 
   // 📡 SENSOR RECONNAISSANCE: Get raw distance measurement
-  float rawDistance = _getDistance(triggerPin, echoPin);
+  float rawDistance = _getRawUltrasonicSensorReading(triggerPin, echoPin);
 
-  // 💾 TACTICAL DATA STORAGE: Always store reading in circular buffer (including zeros)
-  getCapDistanceReadings[readingIndex] = rawDistance;
-  readingIndex = (readingIndex + 1) % 10;
-  totalReadingCount++;
+  // 💾 TACTICAL DATA STORAGE: Store reading in pin-specific circular buffer
+  buffer->readings[buffer->readingIndex] = rawDistance;
+  buffer->readingIndex = (buffer->readingIndex + 1) % 10;
+  buffer->totalReadingCount++;
 
   // 🎯 INITIALIZATION PROTOCOL: Return default for first 10 readings
-  if (totalReadingCount < 10)
+  if (buffer->totalReadingCount < 10)
   {
     return 1000; // 🛡️ BUFFER WARMING: Return safe default until buffer full
   }
 
-  // ⚡ MEAN CALCULATION: Return average of last 10 readings
-  return _calculateMean(getCapDistanceReadings, 10);
+  // ⚡ MEAN CALCULATION: Return average of last 10 readings for this specific pin
+  return _calculateMean(buffer->readings, 10);
+}
+
+float getBottleDistance()
+{
+  return _getUltrasonicSensorDistance(triggerPinBottle, echoPinBottle);
 }
 
 float getCapLoadedDistance()
 {
-  return _getCapDistance(triggerPinCapLoaded, echoPinCapLoaded);
+  return _getUltrasonicSensorDistance(triggerPinCapLoaded, echoPinCapLoaded);
 }
 float getCapFullDistance()
 {
-  return _getCapDistance(triggerPinCapFull, echoPinCapFull);
+  return _getUltrasonicSensorDistance(triggerPinCapFull, echoPinCapFull);
 }
 
 bool isCapLoaded()
@@ -178,12 +201,10 @@ bool isBottleLoaded()
   }
 }
 
-void runConveyor()
+void loadBottle()
 {
   // ⚔️ CONVEYOR DOMINATION PROTOCOL: Run until bottle is loaded
   Serial.println("🚀 CONVEYOR ACTIVATION: Running until bottle loaded");
-
-  digitalWrite(conveyorPin, HIGH);
 
   // 🎯 TACTICAL LOOP: Monitor bottle loading status
   while (!isBottleLoaded())
@@ -197,8 +218,6 @@ void runConveyor()
     delay(50);
   }
 
-  // 🛡️ MISSION ACCOMPLISHED: Stop conveyor when bottle detected
-  digitalWrite(conveyorPin, LOW);
   Serial.println("🏆 BOTTLE LOADED: Conveyor stopped");
 }
 
@@ -207,6 +226,11 @@ void pushBottle()
 
   // ⚔️ BOTTLE PUSH PROTOCOL: Execute 3-second push sequence
   Serial.println("🚀 BOTTLE PUSH ACTIVATION: Initiating push sequence");
+
+  if (isBottleLoaded() == false)
+  {
+    loadBottle();
+  }
 
   // 🎯 TACTICAL ENGAGEMENT: Activate push mechanism
   digitalWrite(pushRegisterPin, HIGH);
