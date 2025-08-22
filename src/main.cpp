@@ -77,7 +77,7 @@ enum MachineState
   STATE_RUNNING = 2
 };
 
-static MachineState machineState = STATE_PAUSED;
+static volatile MachineState machineState = STATE_PAUSED;
 
 static String _getChipIdSuffix()
 {
@@ -122,6 +122,26 @@ static void _applySafeOutputs()
   digitalWrite(pushRegisterPin, LOW);
 }
 
+static inline bool _isRunning()
+{
+  return machineState == STATE_RUNNING;
+}
+
+static bool _waitWithAbort(uint32_t durationMs)
+{
+  uint32_t startMs = millis();
+  while (millis() - startMs < durationMs)
+  {
+    if (!_isRunning())
+    {
+      _applySafeOutputs();
+      return false;
+    }
+    delay(10);
+  }
+  return true;
+}
+
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html>
 <html>
@@ -148,6 +168,14 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     .btn.warn{background:var(--warn);border:0;color:#1a1204}
     .btn.err{background:var(--err);border:0}
     .toolbar{display:flex;gap:8px;flex-wrap:wrap}
+    .btn.big{padding:16px 20px;font-size:18px}
+    .btn.primary.big{box-shadow:0 8px 16px rgba(34,197,94,.25);font-weight:700}
+    .btn.huge{padding:22px 30px;font-size:22px}
+    .btn.primary.huge{box-shadow:0 10px 20px rgba(34,197,94,.28);font-weight:800}
+    .advanced{display:none}
+    body.adv .advanced{display:block}
+    .slide{overflow:hidden;max-height:0;transition:max-height .25s ease}
+    body.adv .slide{max-height:2000px}
     .muted{color:var(--muted);font-size:12px}
     .toast{position:fixed;right:12px;bottom:12px;background:#0b1020;border:1px solid #334155;color:var(--text);padding:10px 12px;border-radius:8px;opacity:0;transform:translateY(8px);transition:all .2s}
     .toast.show{opacity:1;transform:none}
@@ -166,14 +194,18 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     const api=async (p,opt)=>{const r=await fetch(p,{headers:{'Content-Type':'application/json'},...opt});return r.json().catch(()=>({}))};
     const debounce=(fn,ms)=>{let to;return (...args)=>{clearTimeout(to);to=setTimeout(()=>fn(...args),ms)}};
     const setDebounced = {};
+    const lastSettings = {};
     const attachInputHandlers=()=>{
       const keys=['enableFilling','enableCapping','pushTime','fillTime','capTime','postPushDelay','postFillDelay','bottlePositioningDelay','thresholdBottleLoaded','thresholdCapLoaded','thresholdCapFull','rollingAverageWindow'];
       keys.forEach(k=>{
         const el=$(k); if(!el) return;
         if(!setDebounced[k]) setDebounced[k]=debounce((val)=>setKey(k,val), 300);
         const handler=()=>{const val=(el.type==='checkbox')?el.checked:el.value; setDebounced[k](val)};
-        el.addEventListener('input', handler, {passive:true});
-        el.addEventListener('change', handler);
+        if(el.type==='checkbox'){
+          el.addEventListener('change', handler);
+        } else {
+          el.addEventListener('input', handler, {passive:true});
+        }
       });
     };
     const bindTap=(id,handler)=>{
@@ -187,13 +219,19 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       $('status').textContent=`${st.connected? 'Connected':'AP mode'} ${st.ip? '('+st.ip+')':''} · State: ${st.machineState}`;
       const s=await api('/api/settings');
       const map={enableFilling:'enableFilling',enableCapping:'enableCapping',pushTime:'pushTime',fillTime:'fillTime',capTime:'capTime',postPushDelay:'postPushDelay',postFillDelay:'postFillDelay',bottlePositioningDelay:'bottlePositioningDelay',thresholdBottleLoaded:'thresholdBottleLoaded',thresholdCapLoaded:'thresholdCapLoaded',thresholdCapFull:'thresholdCapFull',rollingAverageWindow:'rollingAverageWindow'};
-      Object.keys(map).forEach(k=>{const el=$(k); if(!el) return; if(el.type==='checkbox'){el.checked=!!s[map[k]];} else {el.value=s[map[k]];}});
+      Object.keys(map).forEach(k=>{const el=$(k); if(!el) return; const val=s[map[k]]; if(el.type==='checkbox'){el.checked=!!val;} else {el.value=val;} lastSettings[k]=(el.type==='checkbox')? !!val : String(val);});
       attachInputHandlers();
     };
     const setKey=async(k,v)=>{
-      const form=new URLSearchParams(); form.set('value', v);
-      const r=await fetch(`/api/settings/${k}`,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:form.toString()});
-      if(r.ok){toast('Saved');} else {toast('Failed');}
+      if(v===undefined||v===null||v===''){return;}
+      if(lastSettings[k]===v){return;}
+      const payload={}; payload[k]=v;
+      let r=await fetch(`/api/settings`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      if(!r.ok){
+        const form=new URLSearchParams(); form.set('value', String(v));
+        r=await fetch(`/api/settings/${k}`,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:form.toString()});
+      }
+      if(r.ok){ lastSettings[k]=v; toast('Saved'); } else { toast('Failed'); }
     };
     const saveAll=async()=>{
       const body={
@@ -223,6 +261,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       bindTap('startBtn', ()=>ctl('start'));
       bindTap('pauseBtn', ()=>ctl('pause'));
       bindTap('stopBtn', ()=>ctl('stop'));
+      const advPref=localStorage.getItem('advOpen');
+      if(advPref==='1'){document.body.classList.add('adv');$('advToggle').textContent='Hide Advanced';}
+      bindTap('advToggle',()=>{document.body.classList.toggle('adv');const open=document.body.classList.contains('adv');localStorage.setItem('advOpen',open?'1':'0');$('advToggle').textContent=open?'Hide Advanced':'Show Advanced';});
       load();
     });
   </script>
@@ -240,7 +281,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
             <button id="stopBtn" type="button" class="btn err">Stop</button>
           </div>
         </div>
-        <div class="card">
+        <div class="card advanced">
           <h3>Wi‑Fi</h3>
           <div class="row"><label>SSID</label><input id="ssid" type="text" placeholder="Network name"></div>
           <div class="row"><label>Password</label><input id="password" type="text" placeholder="Password (optional)"></div>
@@ -251,25 +292,30 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 
       <div class="card" style="margin-top:12px">
         <h3>Settings</h3>
+        <div class="toolbar" style="margin:6px 0 10px"><button id="advToggle" class="btn">Show Advanced</button></div>
         <div class="kv">
-          <div class="row"><label>Enable Filling</label><input id="enableFilling" type="checkbox" onchange="setKey('enableFilling', this.checked)"></div>
+          <div class="row"><label>Enable Filling</label><input id="enableFilling" type="checkbox"></div>
           <div></div>
-          <div class="row"><label>Enable Capping</label><input id="enableCapping" type="checkbox" onchange="setKey('enableCapping', this.checked)"></div>
+          <div class="row"><label>Enable Capping</label><input id="enableCapping" type="checkbox"></div>
           <div></div>
 
-          <div class="row"><label>Push Time (ms)</label><input id="pushTime" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('pushTime', this.value)"></div>
-          <div class="row"><label>Fill Time (ms)</label><input id="fillTime" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('fillTime', this.value)"></div>
-          <div class="row"><label>Cap Time (ms)</label><input id="capTime" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('capTime', this.value)"></div>
-          <div class="row"><label>Post‑Push Delay (ms)</label><input id="postPushDelay" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('postPushDelay', this.value)"></div>
-          <div class="row"><label>Post‑Fill Delay (ms)</label><input id="postFillDelay" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('postFillDelay', this.value)"></div>
-          <div class="row"><label>Bottle Positioning Delay (ms)</label><input id="bottlePositioningDelay" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('bottlePositioningDelay', this.value)"></div>
-
-          <div class="row"><label>Threshold Bottle Loaded</label><input id="thresholdBottleLoaded" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('thresholdBottleLoaded', this.value)"></div>
-          <div class="row"><label>Threshold Cap Loaded</label><input id="thresholdCapLoaded" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('thresholdCapLoaded', this.value)"></div>
-          <div class="row"><label>Threshold Cap Full</label><input id="thresholdCapFull" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('thresholdCapFull', this.value)"></div>
-          <div class="row"><label>Rolling Average Window</label><input id="rollingAverageWindow" type="number" inputmode="numeric" pattern="[0-9]*" min="1" max="20" step="1" onchange="setKey('rollingAverageWindow', this.value)"></div>
+          <div class="row"><label>Push Time (ms)</label><input id="pushTime" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1"></div>
+          <div class="row"><label>Fill Time (ms)</label><input id="fillTime" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1"></div>
+          <div class="row"><label>Cap Time (ms)</label><input id="capTime" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1"></div>
         </div>
-        <div class="toolbar" style="margin-top:8px"><button class="btn" onclick="saveAll()">Save All</button></div>
+        <div id="advPanel" class="slide advanced">
+          <div class="kv">
+            <div class="row"><label>Post‑Push Delay (ms)</label><input id="postPushDelay" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1"></div>
+            <div class="row"><label>Post‑Fill Delay (ms)</label><input id="postFillDelay" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1"></div>
+            <div class="row"><label>Bottle Positioning Delay (ms)</label><input id="bottlePositioningDelay" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1"></div>
+
+            <div class="row"><label>Threshold Bottle Loaded</label><input id="thresholdBottleLoaded" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1"></div>
+            <div class="row"><label>Threshold Cap Loaded</label><input id="thresholdCapLoaded" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1"></div>
+            <div class="row"><label>Threshold Cap Full</label><input id="thresholdCapFull" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1"></div>
+            <div class="row"><label>Rolling Average Window</label><input id="rollingAverageWindow" type="number" inputmode="numeric" pattern="[0-9]*" min="1" max="20" step="1"></div>
+          </div>
+        </div>
+        <div class="toolbar" style="margin-top:16px"><button class="btn primary huge" onclick="saveAll()">Save All</button></div>
       </div>
     </div>
     <div id="toast" class="toast"></div>
@@ -905,7 +951,7 @@ void loadBottle()
   Serial.println("🚀 CONVEYOR ACTIVATION: Running until bottle loaded");
 
   // 🎯 TACTICAL LOOP: Monitor bottle loading status
-  while (!isBottleLoaded())
+  while (_isRunning() && !isBottleLoaded())
   {
     // 📡 CONTINUOUS RECONNAISSANCE: Check bottle position
     float currentBottleDistance = getBottleDistance();
@@ -913,7 +959,11 @@ void loadBottle()
     Serial.println(currentBottleDistance);
 
     // ⚡ BRIEF TACTICAL PAUSE: Allow sensor readings to stabilize
-    delay(50);
+    if (!_waitWithAbort(50))
+    {
+      Serial.println("⛔ LOAD BOTTLE ABORTED");
+      return;
+    }
   }
 
   Serial.println("🏆 BOTTLE LOADED: Conveyor stopped");
@@ -928,10 +978,14 @@ void capBottle()
     return;
   }
 
-  while (isCapLoaded() == false)
+  while (_isRunning() && isCapLoaded() == false)
   {
     isBottleLoaded();
-    delay(50);
+    if (!_waitWithAbort(50))
+    {
+      Serial.println("⛔ CAP BOTTLE ABORTED");
+      return;
+    }
   }
 
   // ⚔️ BOTTLE CAP PROTOCOL: Execute 2-second cap sequence
@@ -942,7 +996,12 @@ void capBottle()
   Serial.println("⚡ CAP MECHANISM: Activated for 2 seconds");
 
   // ⏱️ TIMED OPERATION: Maintain cap for precise duration
-  delay(settings.capTime);
+  if (!_waitWithAbort(settings.capTime))
+  {
+    digitalWrite(capPin, LOW);
+    Serial.println("⛔ CAP SEQUENCE ABORTED");
+    return;
+  }
 
   // 🛡️ MISSION COMPLETE: Deactivate cap mechanism
   digitalWrite(capPin, LOW);
@@ -955,10 +1014,14 @@ void pushBottle()
   // ⚔️ BOTTLE PUSH PROTOCOL: Execute push sequence
   Serial.println("🚀 BOTTLE PUSH ACTIVATION: Initiating push sequence");
 
-  while (isBottleLoaded() == false)
+  while (_isRunning() && isBottleLoaded() == false)
   {
     isCapLoaded();
-    delay(50);
+    if (!_waitWithAbort(50))
+    {
+      Serial.println("⛔ PUSH BOTTLE ABORTED");
+      return;
+    }
   }
 
   // 🎯 BOTTLE POSITIONING: Keep conveyor running to position bottle properly
@@ -966,7 +1029,12 @@ void pushBottle()
   Serial.print("🎯 BOTTLE POSITIONING: Conveyor running for ");
   Serial.print(settings.bottlePositioningDelay / 1000.0);
   Serial.println(" seconds to position bottle");
-  delay(settings.bottlePositioningDelay);
+  if (!_waitWithAbort(settings.bottlePositioningDelay))
+  {
+    digitalWrite(conveyorPin, LOW);
+    Serial.println("⛔ POSITIONING ABORTED");
+    return;
+  }
 
   // 🛑 CONVEYOR STOP: Ensure conveyor is stopped during push operation
   digitalWrite(conveyorPin, LOW);
@@ -979,7 +1047,12 @@ void pushBottle()
   Serial.println(" seconds");
 
   // ⏱️ TIMED OPERATION: Maintain push for precise duration
-  delay(settings.pushTime);
+  if (!_waitWithAbort(settings.pushTime))
+  {
+    digitalWrite(pushRegisterPin, LOW);
+    Serial.println("⛔ PUSH ABORTED");
+    return;
+  }
 
   // 🛡️ MISSION COMPLETE: Deactivate push mechanism
   digitalWrite(pushRegisterPin, LOW);
@@ -989,10 +1062,17 @@ void pushBottle()
   Serial.print("⏳ POST-PUSH DELAY: Waiting ");
   Serial.print(settings.postPushDelay / 1000.0);
   Serial.println(" seconds before resuming operations");
-  delay(settings.postPushDelay);
+  if (!_waitWithAbort(settings.postPushDelay))
+  {
+    Serial.println("⛔ POST-PUSH DELAY ABORTED");
+    return;
+  }
   Serial.println("✅ POST-PUSH DELAY COMPLETE: Resuming operations");
 
-  capBottle();
+  if (_isRunning())
+  {
+    capBottle();
+  }
 }
 
 void fillBottle()
@@ -1007,10 +1087,14 @@ void fillBottle()
   // ⚔️ BOTTLE FILL PROTOCOL: Execute 5-second fill sequence
   Serial.println("🚀 BOTTLE FILL ACTIVATION: Initiating fill sequence");
 
-  while (isBottleLoaded() == false)
+  while (_isRunning() && isBottleLoaded() == false)
   {
     isCapLoaded();
-    delay(50);
+    if (!_waitWithAbort(50))
+    {
+      Serial.println("⛔ FILL BOTTLE ABORTED");
+      return;
+    }
   }
 
   // 🎯 TACTICAL ENGAGEMENT: Activate fill mechanism
@@ -1020,7 +1104,12 @@ void fillBottle()
   Serial.println(" seconds");
 
   // ⏱️ TIMED OPERATION: Maintain fill for precise duration
-  delay(settings.fillTime);
+  if (!_waitWithAbort(settings.fillTime))
+  {
+    digitalWrite(fillPin, LOW);
+    Serial.println("⛔ FILL SEQUENCE ABORTED");
+    return;
+  }
 
   // 🛡️ MISSION COMPLETE: Deactivate fill mechanism
   digitalWrite(fillPin, LOW);
@@ -1030,7 +1119,11 @@ void fillBottle()
   Serial.print("⏳ POST-FILL DELAY: Waiting ");
   Serial.print(settings.postFillDelay / 1000.0);
   Serial.println(" seconds before next operation");
-  delay(settings.postFillDelay);
+  if (!_waitWithAbort(settings.postFillDelay))
+  {
+    Serial.println("⛔ POST-FILL DELAY ABORTED");
+    return;
+  }
   Serial.println("✅ POST-FILL DELAY COMPLETE: Ready for next operation");
 }
 
@@ -1050,30 +1143,37 @@ void loop()
   }
 
   // STATE_RUNNING
-  while ((isBottleLoaded() == false || isCapLoaded() == false) && machineState == STATE_RUNNING)
+  while ((isBottleLoaded() == false || isCapLoaded() == false) && _isRunning())
   {
-    delay(50);
+    if (!_waitWithAbort(50))
+    {
+      return;
+    }
   }
-  if (machineState != STATE_RUNNING)
+  if (!_isRunning())
   {
     return;
   }
   pushBottle();
+  if (!_isRunning())
+    return;
   pushBottle();
+  if (!_isRunning())
+    return;
   pushBottle();
 
-  if (settings.enableFilling && machineState == STATE_RUNNING)
+  if (settings.enableFilling && _isRunning())
   {
     fillBottle();
   }
 
-  if (machineState != STATE_RUNNING)
+  if (!_isRunning())
   {
     return;
   }
   pushBottle();
 
-  if (settings.enableFilling && machineState == STATE_RUNNING)
+  if (settings.enableFilling && _isRunning())
   {
     fillBottle();
   }
