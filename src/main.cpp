@@ -1,8 +1,15 @@
 #include <Arduino.h>
 
+// Operation control flags - set to false to disable specific operations
+const bool enableFilling = true;  // Set to false to skip filling operations
+const bool enableCapping = false; // Set to false to skip capping operations
+
 const long pushTime = 3000L;
-const long fillTime = 5000L;
+const long fillTime = 32000L;
 const long capTime = 2000L;
+const long postPushDelay = 3000L;          // Delay after push operation before resuming
+const long postFillDelay = 1000L;          // Delay after fill operation before next push
+const long bottlePositioningDelay = 1000L; // Delay to keep conveyor running after bottle detection
 
 const int conveyorPin = 14;
 const int capLoaderPin = 27;
@@ -20,8 +27,11 @@ const int triggerPinCapFull = 23;
 const int echoPinCapFull = 22;
 
 // Used to check if the cap loader has a cap available to bottle
-const int triggerPinCapLoaded = 15;
+const int triggerPinCapLoaded = 18;
 const int echoPinCapLoaded = 5;
+
+const int rollingAverageCount = 5;
+const int maxSensorBuffers = 10; // Maximum number of different sensor buffers supported
 
 // 🧮 MATHEMATICAL WARFARE: Calculate mean of readings array
 float _calculateMean(float *readings, int count)
@@ -66,15 +76,15 @@ float _getRawUltrasonicSensorReading(int triggerPin, int echoPin)
 // 🎯 UNIVERSAL SENSOR BUFFER SYSTEM: Map-like structure for per-pin rolling averages
 struct SensorBuffer
 {
-  float readings[10];
+  float readings[rollingAverageCount];
   int readingIndex;
   int totalReadingCount;
 };
 
 // 🏛️ SENSOR BUFFER REGISTRY: Static storage for multiple sensor buffers
-static SensorBuffer sensorBuffers[10]; // Support up to 10 different trigger pins
-static int registeredPins[10];         // Track which pins are registered
-static int bufferCount = 0;            // Number of registered buffers
+static SensorBuffer sensorBuffers[maxSensorBuffers]; // Support up to maxSensorBuffers different trigger pins
+static int registeredPins[maxSensorBuffers];         // Track which pins are registered
+static int bufferCount = 0;                          // Number of registered buffers
 
 // 🔍 BUFFER RECONNAISSANCE: Find or create buffer for specific trigger pin
 SensorBuffer *_getSensorBuffer(int triggerPin)
@@ -89,12 +99,12 @@ SensorBuffer *_getSensorBuffer(int triggerPin)
   }
 
   // 🚀 NEW BUFFER CREATION: Register new pin if space available
-  if (bufferCount < 10)
+  if (bufferCount < maxSensorBuffers)
   {
     registeredPins[bufferCount] = triggerPin;
     SensorBuffer *newBuffer = &sensorBuffers[bufferCount];
     // 🛡️ BUFFER INITIALIZATION: Zero out new buffer
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < rollingAverageCount; i++)
     {
       newBuffer->readings[i] = 0;
     }
@@ -118,17 +128,22 @@ float _getUltrasonicSensorDistance(int triggerPin, int echoPin)
 
   // 💾 TACTICAL DATA STORAGE: Store reading in pin-specific circular buffer
   buffer->readings[buffer->readingIndex] = rawDistance;
-  buffer->readingIndex = (buffer->readingIndex + 1) % 10;
+  buffer->readingIndex = (buffer->readingIndex + 1) % rollingAverageCount;
   buffer->totalReadingCount++;
 
-  // 🎯 INITIALIZATION PROTOCOL: Return default for first 10 readings
-  if (buffer->totalReadingCount < 10)
+  // 🎯 INITIALIZATION PROTOCOL: Return default for first rollingAverageCount readings
+  if (buffer->totalReadingCount < rollingAverageCount)
   {
     return 1000; // 🛡️ BUFFER WARMING: Return safe default until buffer full
   }
 
-  // ⚡ MEAN CALCULATION: Return average of last 10 readings for this specific pin
-  return _calculateMean(buffer->readings, 10);
+  // ⚡ MEAN CALCULATION: Return average of last rollingAverageCount readings for this specific pin
+  float mean = _calculateMean(buffer->readings, rollingAverageCount);
+  if (mean < 0.01)
+  {
+    return 1000;
+  }
+  return mean;
 }
 
 float getBottleDistance()
@@ -138,17 +153,34 @@ float getBottleDistance()
 
 float getCapLoadedDistance()
 {
+  // 🔧 OPERATION CHECK: Return safe distance when capping is disabled
+  if (!enableCapping)
+  {
+    return 50; // Return distance indicating cap is loaded
+  }
   return _getUltrasonicSensorDistance(triggerPinCapLoaded, echoPinCapLoaded);
 }
 float getCapFullDistance()
 {
+  // 🔧 OPERATION CHECK: Return safe distance when capping is disabled
+  if (!enableCapping)
+  {
+    return 50; // Return distance indicating cap loader is full
+  }
   return _getUltrasonicSensorDistance(triggerPinCapFull, echoPinCapFull);
 }
 
 bool isCapLoaded()
 {
+  // 🔧 OPERATION CHECK: Assume cap is always loaded when capping is disabled
+  if (!enableCapping)
+  {
+    Serial.println("🚫 CAPPING DISABLED: Assuming cap is loaded");
+    digitalWrite(capLoaderPin, LOW); // Stop cap loader when capping disabled
+    return true;
+  }
 
-  const int maxDistance = 250;
+  const int maxDistance = 160;
   float capLoadedDistance = getCapLoadedDistance();
   float capFullDistance = getCapFullDistance();
 
@@ -221,63 +253,21 @@ void loadBottle()
   Serial.println("🏆 BOTTLE LOADED: Conveyor stopped");
 }
 
-void pushBottle()
-{
-
-  // ⚔️ BOTTLE PUSH PROTOCOL: Execute 3-second push sequence
-  Serial.println("🚀 BOTTLE PUSH ACTIVATION: Initiating push sequence");
-
-  if (isBottleLoaded() == false)
-  {
-    loadBottle();
-  }
-
-  // 🎯 TACTICAL ENGAGEMENT: Activate push mechanism
-  digitalWrite(pushRegisterPin, HIGH);
-  Serial.println("⚡ PUSH MECHANISM: Activated for 3 seconds");
-
-  // ⏱️ TIMED OPERATION: Maintain push for precise duration
-  delay(pushTime);
-
-  // 🛡️ MISSION COMPLETE: Deactivate push mechanism
-  digitalWrite(pushRegisterPin, LOW);
-  Serial.println("🏆 PUSH SEQUENCE COMPLETE: Bottle pushed successfully");
-}
-
-void fillBottle()
-{
-  // ⚔️ BOTTLE FILL PROTOCOL: Execute 5-second fill sequence
-  Serial.println("🚀 BOTTLE FILL ACTIVATION: Initiating fill sequence");
-
-  // 🎯 TACTICAL ENGAGEMENT: Activate fill mechanism
-  digitalWrite(fillPin, HIGH);
-  Serial.println("⚡ FILL MECHANISM: Activated for 5 seconds");
-
-  // ⏱️ TIMED OPERATION: Maintain fill for precise duration
-  delay(fillTime);
-
-  // 🛡️ MISSION COMPLETE: Deactivate fill mechanism
-  digitalWrite(fillPin, LOW);
-  Serial.println("🏆 FILL SEQUENCE COMPLETE: Bottle filled successfully");
-}
-
-void fillAndCapBottle()
-{
-
-  Serial.println("🚀 FILL AND CAP ACTIVATION: Initiating fill and cap sequence");
-  digitalWrite(fillPin, HIGH);
-  digitalWrite(capPin, HIGH);
-
-  delay(max(fillTime, capTime));
-
-  digitalWrite(fillPin, LOW);
-  digitalWrite(capPin, LOW);
-
-  Serial.println("🏆 FILL AND CAP SEQUENCE COMPLETE: Bottle filled and capped successfully");
-}
-
 void capBottle()
 {
+  // 🔧 OPERATION CHECK: Skip if capping is disabled
+  if (!enableCapping)
+  {
+    Serial.println("🚫 CAPPING DISABLED: Skipping cap sequence");
+    return;
+  }
+
+  while (isCapLoaded() == false)
+  {
+    isBottleLoaded();
+    delay(50);
+  }
+
   // ⚔️ BOTTLE CAP PROTOCOL: Execute 2-second cap sequence
   Serial.println("🚀 BOTTLE CAP ACTIVATION: Initiating cap sequence");
 
@@ -293,103 +283,213 @@ void capBottle()
   Serial.println("🏆 CAP SEQUENCE COMPLETE: Bottle capped successfully");
 }
 
+void pushBottle()
+{
+
+  // ⚔️ BOTTLE PUSH PROTOCOL: Execute push sequence
+  Serial.println("🚀 BOTTLE PUSH ACTIVATION: Initiating push sequence");
+
+  while (isBottleLoaded() == false)
+  {
+    isCapLoaded();
+    delay(50);
+  }
+
+  // 🎯 BOTTLE POSITIONING: Keep conveyor running to position bottle properly
+  digitalWrite(conveyorPin, HIGH);
+  Serial.print("🎯 BOTTLE POSITIONING: Conveyor running for ");
+  Serial.print(bottlePositioningDelay / 1000.0);
+  Serial.println(" seconds to position bottle");
+  delay(bottlePositioningDelay);
+
+  // 🛑 CONVEYOR STOP: Ensure conveyor is stopped during push operation
+  digitalWrite(conveyorPin, LOW);
+  Serial.println("🛑 CONVEYOR STOPPED: For push operation");
+
+  // 🎯 TACTICAL ENGAGEMENT: Activate push mechanism
+  digitalWrite(pushRegisterPin, HIGH);
+  Serial.print("⚡ PUSH MECHANISM: Activated for ");
+  Serial.print(pushTime / 1000.0);
+  Serial.println(" seconds");
+
+  // ⏱️ TIMED OPERATION: Maintain push for precise duration
+  delay(pushTime);
+
+  // 🛡️ MISSION COMPLETE: Deactivate push mechanism
+  digitalWrite(pushRegisterPin, LOW);
+  Serial.println("🏆 PUSH SEQUENCE COMPLETE: Bottle pushed successfully");
+
+  // ⏳ POST-PUSH DELAY: Wait before resuming operations
+  Serial.print("⏳ POST-PUSH DELAY: Waiting ");
+  Serial.print(postPushDelay / 1000.0);
+  Serial.println(" seconds before resuming operations");
+  delay(postPushDelay);
+  Serial.println("✅ POST-PUSH DELAY COMPLETE: Resuming operations");
+
+  capBottle();
+}
+
+void fillBottle()
+{
+  // 🔧 OPERATION CHECK: Skip if filling is disabled
+  if (!enableFilling)
+  {
+    Serial.println("🚫 FILLING DISABLED: Skipping fill sequence");
+    return;
+  }
+
+  // ⚔️ BOTTLE FILL PROTOCOL: Execute 5-second fill sequence
+  Serial.println("🚀 BOTTLE FILL ACTIVATION: Initiating fill sequence");
+
+  while (isBottleLoaded() == false)
+  {
+    isCapLoaded();
+    delay(50);
+  }
+
+  // 🎯 TACTICAL ENGAGEMENT: Activate fill mechanism
+  digitalWrite(fillPin, HIGH);
+  Serial.print("⚡ FILL MECHANISM: Activated for ");
+  Serial.print(fillTime / 1000.0);
+  Serial.println(" seconds");
+
+  // ⏱️ TIMED OPERATION: Maintain fill for precise duration
+  delay(fillTime);
+
+  // 🛡️ MISSION COMPLETE: Deactivate fill mechanism
+  digitalWrite(fillPin, LOW);
+  Serial.println("🏆 FILL SEQUENCE COMPLETE: Bottle filled successfully");
+
+  // ⏳ POST-FILL DELAY: Wait before next push operation
+  Serial.print("⏳ POST-FILL DELAY: Waiting ");
+  Serial.print(postFillDelay / 1000.0);
+  Serial.println(" seconds before next operation");
+  delay(postFillDelay);
+  Serial.println("✅ POST-FILL DELAY COMPLETE: Ready for next operation");
+}
+
 // State management
-int currentAction = 1;
+// int currentAction = 1;
+
+// void loop()
+// {
+//   // 🔍 SENSOR RECONNAISSANCE: Gather distance intelligence from both sensors
+//   float bottleDistance = getBottleDistance();
+//   float capDistance = getCapLoadedDistance();
+
+//   bool isCapLoadedValue = isCapLoaded();
+//   bool isBottleLoadedValue = isBottleLoaded();
+
+//   // 📡 TACTICAL COMMUNICATION: Report sensor data to command center
+//   Serial.print("Bottle Distance: ");
+//   Serial.print(bottleDistance);
+//   Serial.print(" | Cap Distance: ");
+//   Serial.println(capDistance);
+
+//   if (isCapLoadedValue == false)
+//   {
+//     Serial.println("⚔️ CAP NOT LOADED: Activating cap loader");
+//     digitalWrite(capLoaderPin, HIGH);
+//   }
+//   else
+//   {
+//     digitalWrite(capLoaderPin, LOW);
+//   }
+
+//   if (isBottleLoadedValue == false)
+//   {
+//     Serial.println("⚔️ BOTTLE NOT LOADED: Activating conveyor");
+//     digitalWrite(conveyorPin, HIGH);
+//   }
+//   else
+//   {
+//     digitalWrite(conveyorPin, LOW);
+//   }
+
+//   if (currentAction == 1)
+//   {
+//     for (int i = 0; i < 3; i++)
+//     {
+//       while (isBottleLoaded() == false)
+//       {
+//         isCapLoaded(); // Stop the capper if we are waiting on bottle
+//         delay(50);
+//       }
+//       pushBottle();
+//     }
+//     currentAction = 2;
+//   }
+//   else if (currentAction == 2)
+//   {
+//     fillBottle();
+//     currentAction = 3;
+//   }
+//   else if (currentAction == 3)
+//   {
+//     while (isBottleLoaded() != true)
+//     {
+//       isCapLoaded(); // Stop the capper if we are waiting on bottle
+//       delay(50);
+//     }
+//     pushBottle();
+//     currentAction = 4;
+//   }
+//   else if (currentAction == 4)
+//   {
+//     fillBottle();
+//     currentAction = 5;
+//   }
+//   else if (currentAction == 5)
+//   {
+//     while (isBottleLoaded() != true && isCapLoaded() != true)
+//     {
+//       delay(50);
+//     }
+//     pushBottle();
+//     pushBottle();
+//     currentAction = 6;
+//   }
+//   else if (currentAction == 6)
+//   {
+//     while (isCapLoaded() != true)
+//     {
+//       isBottleLoaded(); // Stop the conveyor if we are waiting on cap
+//       delay(50);
+//     }
+//     fillBottle();
+//     currentAction = 1;
+//   }
+//   delay(50);
+// }
+
+// Double filler sequence
+
+// 1. Push 3 bottles
+// 2. Fill bottle
+// 3. Push bottle
+// 4. Fill bottle
 
 void loop()
 {
-  // 🔍 SENSOR RECONNAISSANCE: Gather distance intelligence from both sensors
-  float bottleDistance = getBottleDistance();
-  float capDistance = getCapLoadedDistance();
-
-  bool isCapLoadedValue = isCapLoaded();
-  bool isBottleLoadedValue = isBottleLoaded();
-
-  // 📡 TACTICAL COMMUNICATION: Report sensor data to command center
-  Serial.print("Bottle Distance: ");
-  Serial.print(bottleDistance);
-  Serial.print(" | Cap Distance: ");
-  Serial.println(capDistance);
-
-  if (isCapLoadedValue == false)
+  while (isBottleLoaded() == false || isCapLoaded() == false)
   {
-    Serial.println("⚔️ CAP NOT LOADED: Activating cap loader");
-    digitalWrite(capLoaderPin, HIGH);
+    delay(50);
   }
-  else
-  {
-    digitalWrite(capLoaderPin, LOW);
-  }
+  pushBottle();
+  pushBottle();
+  pushBottle();
 
-  if (isBottleLoadedValue == false)
-  {
-    Serial.println("⚔️ BOTTLE NOT LOADED: Activating conveyor");
-    digitalWrite(conveyorPin, HIGH);
-  }
-  else
-  {
-    digitalWrite(conveyorPin, LOW);
-  }
-
-  if (currentAction == 1)
-  {
-    for (int i = 0; i < 3; i++)
-    {
-      while (isBottleLoaded() == false)
-      {
-        isCapLoaded(); // Stop the capper if we are waiting on bottle
-        delay(100);
-      }
-      pushBottle();
-      while (isCapLoaded() == false)
-      {
-        isBottleLoaded(); // Stop the conveyor if we are waiting on cap
-        delay(100);
-      }
-      capBottle();
-    }
-    currentAction = 2;
-  }
-  else if (currentAction == 2)
+  // Conditionally fill bottle if filling is enabled
+  if (enableFilling)
   {
     fillBottle();
-    currentAction = 3;
-  }
-  else if (currentAction == 3)
-  {
-    while (isBottleLoaded() != true)
-    {
-      isCapLoaded(); // Stop the capper if we are waiting on bottle
-      delay(100);
-    }
-    pushBottle();
-    currentAction = 4;
-  }
-  else if (currentAction == 4)
-  {
-    fillBottle();
-    currentAction = 5;
-  }
-  else if (currentAction == 5)
-  {
-    while (isBottleLoaded() != true)
-    {
-      isCapLoaded(); // Stop the capper if we are waiting on bottle
-      delay(100);
-    }
-    pushBottle();
-    currentAction = 6;
-  }
-  else if (currentAction == 6)
-  {
-    while (isCapLoaded() != true)
-    {
-      isBottleLoaded(); // Stop the conveyor if we are waiting on cap
-      delay(100);
-    }
-    fillAndCapBottle();
-    currentAction = 1;
   }
 
-  delay(100);
+  pushBottle();
+
+  // Conditionally fill bottle again if filling is enabled
+  if (enableFilling)
+  {
+    fillBottle();
+  }
 }
