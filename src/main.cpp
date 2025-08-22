@@ -1,15 +1,46 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <Preferences.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+#include <ESPmDNS.h>
 
-// Operation control flags - set to false to disable specific operations
-const bool enableFilling = true;  // Set to false to skip filling operations
-const bool enableCapping = false; // Set to false to skip capping operations
+// ===== Settings (persisted) =====
+struct Settings
+{
+  bool enableFilling;
+  bool enableCapping;
 
-const long pushTime = 3000L;
-const long fillTime = 32000L;
-const long capTime = 2000L;
-const long postPushDelay = 3000L;          // Delay after push operation before resuming
-const long postFillDelay = 1000L;          // Delay after fill operation before next push
-const long bottlePositioningDelay = 1000L; // Delay to keep conveyor running after bottle detection
+  long pushTime;
+  long fillTime;
+  long capTime;
+  long postPushDelay;
+  long postFillDelay;
+  long bottlePositioningDelay;
+
+  // Ultrasonic detection thresholds (in microseconds of echo pulse)
+  int thresholdBottleLoaded;
+  int thresholdCapLoaded;
+  int thresholdCapFull;
+
+  // Rolling average window (runtime adjustable)
+  int rollingAverageWindow;
+};
+
+static Settings settings = {
+    /*enableFilling*/ true,
+    /*enableCapping*/ false,
+    /*pushTime*/ 3000L,
+    /*fillTime*/ 32000L,
+    /*capTime*/ 2000L,
+    /*postPushDelay*/ 3000L,
+    /*postFillDelay*/ 1000L,
+    /*bottlePositioningDelay*/ 1000L,
+    /*thresholdBottleLoaded*/ 200,
+    /*thresholdCapLoaded*/ 160,
+    /*thresholdCapFull*/ 160,
+    /*rollingAverageWindow*/ 5};
 
 const int conveyorPin = 14;
 const int capLoaderPin = 27;
@@ -30,24 +61,648 @@ const int echoPinCapFull = 22;
 const int triggerPinCapLoaded = 18;
 const int echoPinCapLoaded = 5;
 
-const int rollingAverageCount = 5;
+const int MAX_ROLLING_AVG = 20;  // Absolute upper bound for rolling window
 const int maxSensorBuffers = 10; // Maximum number of different sensor buffers supported
 
-// 🧮 MATHEMATICAL WARFARE: Calculate mean of readings array
-float _calculateMean(float *readings, int count)
+// ===== Persistence and Networking =====
+Preferences prefsSettings;
+Preferences prefsWifi;
+AsyncWebServer server(80);
+static String g_hostname;
+
+enum MachineState
 {
-  float sum = 0;
-  for (int i = 0; i < count; i++)
+  STATE_STOPPED = 0,
+  STATE_PAUSED = 1,
+  STATE_RUNNING = 2
+};
+
+static MachineState machineState = STATE_PAUSED;
+
+static String _getChipIdSuffix()
+{
+  uint64_t mac = ESP.getEfuseMac();
+  uint16_t suffix = (uint16_t)(mac & 0xFFFF);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%04X", suffix);
+  return String(buf);
+}
+
+static String _getHostname()
+{
+  if (g_hostname.length() > 0)
   {
-    sum += readings[i];
+    return g_hostname;
   }
-  return sum / count;
+  g_hostname = String("bottling-machine-") + _getChipIdSuffix();
+  return g_hostname;
+}
+
+static void _setupMDNS()
+{
+  String host = _getHostname();
+  MDNS.end();
+  bool ok = MDNS.begin(host.c_str());
+  Serial.print("Starting mDNS: ");
+  Serial.print(host);
+  Serial.print(".local => ");
+  Serial.println(ok ? "OK" : "FAIL");
+  if (ok)
+  {
+    MDNS.addService("http", "tcp", 80);
+  }
+}
+
+static void _applySafeOutputs()
+{
+  digitalWrite(conveyorPin, LOW);
+  digitalWrite(capLoaderPin, LOW);
+  digitalWrite(fillPin, LOW);
+  digitalWrite(capPin, LOW);
+  digitalWrite(pushRegisterPin, LOW);
+}
+
+static const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Bottling Machine</title>
+  <style>
+    :root{--bg:#0f172a;--card:#111827;--text:#e5e7eb;--muted:#9ca3af;--accent:#22c55e;--accent2:#60a5fa;--warn:#f59e0b;--err:#ef4444}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;-webkit-tap-highlight-color:transparent}
+    .container{max-width:960px;margin:0 auto;padding:16px}
+    h1{font-size:22px;margin:8px 0 16px}
+    .grid{display:grid;grid-template-columns:1fr;gap:12px}
+    @media(min-width:800px){.grid{grid-template-columns:1fr 1fr}}
+    .card{background:var(--card);border:1px solid #1f2937;border-radius:12px;padding:16px}
+    .row{display:flex;gap:8px;align-items:center;margin:6px 0}
+    label{min-width:220px;color:var(--muted)}
+    input[type="text"], input[type="number"]{flex:1;background:#0b1020;color:var(--text);border:1px solid #1f2937;border-radius:8px;padding:12px 12px;font-size:16px;min-height:44px}
+    input[type="checkbox"]{transform:scale(1.2)}
+    .btn{background:#1f2937;border:1px solid #334155;color:var(--text);padding:12px 14px;border-radius:10px;cursor:pointer;min-height:44px;min-width:44px;touch-action:manipulation}
+    .btn.primary{background:var(--accent);border:0;color:#04130a}
+    .btn.alt{background:var(--accent2);border:0;color:#06131f}
+    .btn.warn{background:var(--warn);border:0;color:#1a1204}
+    .btn.err{background:var(--err);border:0}
+    .toolbar{display:flex;gap:8px;flex-wrap:wrap}
+    .muted{color:var(--muted);font-size:12px}
+    .toast{position:fixed;right:12px;bottom:12px;background:#0b1020;border:1px solid #334155;color:var(--text);padding:10px 12px;border-radius:8px;opacity:0;transform:translateY(8px);transition:all .2s}
+    .toast.show{opacity:1;transform:none}
+    .kv{display:grid;grid-template-columns:1fr;gap:8px}
+    @media(max-width:600px){
+      .container{padding:12px}
+      label{min-width:0;width:100%}
+      .row{flex-direction:column;align-items:stretch}
+      input[type="text"], input[type="number"]{width:100%}
+      .kv{display:block}
+    }
+  </style>
+  <script>
+    const toast=(msg)=>{const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800)};
+    const $=(id)=>document.getElementById(id);
+    const api=async (p,opt)=>{const r=await fetch(p,{headers:{'Content-Type':'application/json'},...opt});return r.json().catch(()=>({}))};
+    const debounce=(fn,ms)=>{let to;return (...args)=>{clearTimeout(to);to=setTimeout(()=>fn(...args),ms)}};
+    const setDebounced = {};
+    const attachInputHandlers=()=>{
+      const keys=['enableFilling','enableCapping','pushTime','fillTime','capTime','postPushDelay','postFillDelay','bottlePositioningDelay','thresholdBottleLoaded','thresholdCapLoaded','thresholdCapFull','rollingAverageWindow'];
+      keys.forEach(k=>{
+        const el=$(k); if(!el) return;
+        if(!setDebounced[k]) setDebounced[k]=debounce((val)=>setKey(k,val), 300);
+        const handler=()=>{const val=(el.type==='checkbox')?el.checked:el.value; setDebounced[k](val)};
+        el.addEventListener('input', handler, {passive:true});
+        el.addEventListener('change', handler);
+      });
+    };
+    const bindTap=(id,handler)=>{
+      const el=$(id); if(!el) return;
+      let touched=false;
+      el.addEventListener('touchstart', e=>{touched=true; handler(e); e.preventDefault();}, {passive:false});
+      el.addEventListener('click', e=>{ if(touched){touched=false; return;} handler(e); });
+    };
+    const load=async()=>{
+      const st=await api('/api/status');
+      $('status').textContent=`${st.connected? 'Connected':'AP mode'} ${st.ip? '('+st.ip+')':''} · State: ${st.machineState}`;
+      const s=await api('/api/settings');
+      const map={enableFilling:'enableFilling',enableCapping:'enableCapping',pushTime:'pushTime',fillTime:'fillTime',capTime:'capTime',postPushDelay:'postPushDelay',postFillDelay:'postFillDelay',bottlePositioningDelay:'bottlePositioningDelay',thresholdBottleLoaded:'thresholdBottleLoaded',thresholdCapLoaded:'thresholdCapLoaded',thresholdCapFull:'thresholdCapFull',rollingAverageWindow:'rollingAverageWindow'};
+      Object.keys(map).forEach(k=>{const el=$(k); if(!el) return; if(el.type==='checkbox'){el.checked=!!s[map[k]];} else {el.value=s[map[k]];}});
+      attachInputHandlers();
+    };
+    const setKey=async(k,v)=>{
+      const form=new URLSearchParams(); form.set('value', v);
+      const r=await fetch(`/api/settings/${k}`,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:form.toString()});
+      if(r.ok){toast('Saved');} else {toast('Failed');}
+    };
+    const saveAll=async()=>{
+      const body={
+        enableFilling:$('enableFilling').checked,
+        enableCapping:$('enableCapping').checked,
+        pushTime:+$('pushTime').value,
+        fillTime:+$('fillTime').value,
+        capTime:+$('capTime').value,
+        postPushDelay:+$('postPushDelay').value,
+        postFillDelay:+$('postFillDelay').value,
+        bottlePositioningDelay:+$('bottlePositioningDelay').value,
+        thresholdBottleLoaded:+$('thresholdBottleLoaded').value,
+        thresholdCapLoaded:+$('thresholdCapLoaded').value,
+        thresholdCapFull:+$('thresholdCapFull').value,
+        rollingAverageWindow:+$('rollingAverageWindow').value,
+      };
+      const r=await api('/api/settings',{method:'POST',body:JSON.stringify(body)});
+      toast('Settings saved');
+    };
+    const wifiConnect=async()=>{
+      const r=await api('/api/wifi',{method:'POST',body:JSON.stringify({ssid:$('ssid').value,password:$('password').value})});
+      toast(r.connected? 'Wi‑Fi connected':'Wi‑Fi failed');
+      load();
+    };
+    const ctl=async(a)=>{await api('/api/control',{method:'POST',body:JSON.stringify({action:a})});toast(`Action: ${a}`);load();};
+    window.addEventListener('DOMContentLoaded',()=>{
+      bindTap('startBtn', ()=>ctl('start'));
+      bindTap('pauseBtn', ()=>ctl('pause'));
+      bindTap('stopBtn', ()=>ctl('stop'));
+      load();
+    });
+  </script>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Bottling Machine</h1>
+      <div class="muted" id="status">Loading…</div>
+      <div class="grid" style="margin-top:10px">
+        <div class="card">
+          <h3>Controls</h3>
+          <div class="toolbar">
+            <button id="startBtn" type="button" class="btn primary">Start</button>
+            <button id="pauseBtn" type="button" class="btn warn">Pause</button>
+            <button id="stopBtn" type="button" class="btn err">Stop</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Wi‑Fi</h3>
+          <div class="row"><label>SSID</label><input id="ssid" type="text" placeholder="Network name"></div>
+          <div class="row"><label>Password</label><input id="password" type="text" placeholder="Password (optional)"></div>
+          <div class="toolbar"><button class="btn alt" onclick="wifiConnect()">Connect</button></div>
+          <div class="muted">If connection succeeds, the AP will stop broadcasting.</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <h3>Settings</h3>
+        <div class="kv">
+          <div class="row"><label>Enable Filling</label><input id="enableFilling" type="checkbox" onchange="setKey('enableFilling', this.checked)"></div>
+          <div></div>
+          <div class="row"><label>Enable Capping</label><input id="enableCapping" type="checkbox" onchange="setKey('enableCapping', this.checked)"></div>
+          <div></div>
+
+          <div class="row"><label>Push Time (ms)</label><input id="pushTime" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('pushTime', this.value)"></div>
+          <div class="row"><label>Fill Time (ms)</label><input id="fillTime" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('fillTime', this.value)"></div>
+          <div class="row"><label>Cap Time (ms)</label><input id="capTime" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('capTime', this.value)"></div>
+          <div class="row"><label>Post‑Push Delay (ms)</label><input id="postPushDelay" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('postPushDelay', this.value)"></div>
+          <div class="row"><label>Post‑Fill Delay (ms)</label><input id="postFillDelay" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('postFillDelay', this.value)"></div>
+          <div class="row"><label>Bottle Positioning Delay (ms)</label><input id="bottlePositioningDelay" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('bottlePositioningDelay', this.value)"></div>
+
+          <div class="row"><label>Threshold Bottle Loaded</label><input id="thresholdBottleLoaded" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('thresholdBottleLoaded', this.value)"></div>
+          <div class="row"><label>Threshold Cap Loaded</label><input id="thresholdCapLoaded" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('thresholdCapLoaded', this.value)"></div>
+          <div class="row"><label>Threshold Cap Full</label><input id="thresholdCapFull" type="number" inputmode="numeric" pattern="[0-9]*" min="0" step="1" onchange="setKey('thresholdCapFull', this.value)"></div>
+          <div class="row"><label>Rolling Average Window</label><input id="rollingAverageWindow" type="number" inputmode="numeric" pattern="[0-9]*" min="1" max="20" step="1" onchange="setKey('rollingAverageWindow', this.value)"></div>
+        </div>
+        <div class="toolbar" style="margin-top:8px"><button class="btn" onclick="saveAll()">Save All</button></div>
+      </div>
+    </div>
+    <div id="toast" class="toast"></div>
+  </body>
+</html>
+)HTML";
+
+static void loadSettings()
+{
+  prefsSettings.begin("bm", true);
+  settings.enableFilling = prefsSettings.getBool("enableFill", settings.enableFilling);
+  settings.enableCapping = prefsSettings.getBool("enableCap", settings.enableCapping);
+  settings.pushTime = (long)prefsSettings.getInt("pushTime", settings.pushTime);
+  settings.fillTime = (long)prefsSettings.getInt("fillTime", settings.fillTime);
+  settings.capTime = (long)prefsSettings.getInt("capTime", settings.capTime);
+  settings.postPushDelay = (long)prefsSettings.getInt("postPush", settings.postPushDelay);
+  settings.postFillDelay = (long)prefsSettings.getInt("postFill", settings.postFillDelay);
+  settings.bottlePositioningDelay = (long)prefsSettings.getInt("posDelay", settings.bottlePositioningDelay);
+  settings.thresholdBottleLoaded = prefsSettings.getInt("thBottle", settings.thresholdBottleLoaded);
+  settings.thresholdCapLoaded = prefsSettings.getInt("thCapLoad", settings.thresholdCapLoaded);
+  settings.thresholdCapFull = prefsSettings.getInt("thCapFull", settings.thresholdCapFull);
+  settings.rollingAverageWindow = prefsSettings.getInt("rollAvg", settings.rollingAverageWindow);
+  prefsSettings.end();
+
+  if (settings.rollingAverageWindow < 1)
+  {
+    settings.rollingAverageWindow = 1;
+  }
+  if (settings.rollingAverageWindow > MAX_ROLLING_AVG)
+  {
+    settings.rollingAverageWindow = MAX_ROLLING_AVG;
+  }
+}
+
+static void saveSettings()
+{
+  prefsSettings.begin("bm", false);
+  prefsSettings.putBool("enableFill", settings.enableFilling);
+  prefsSettings.putBool("enableCap", settings.enableCapping);
+  prefsSettings.putInt("pushTime", (int)settings.pushTime);
+  prefsSettings.putInt("fillTime", (int)settings.fillTime);
+  prefsSettings.putInt("capTime", (int)settings.capTime);
+  prefsSettings.putInt("postPush", (int)settings.postPushDelay);
+  prefsSettings.putInt("postFill", (int)settings.postFillDelay);
+  prefsSettings.putInt("posDelay", (int)settings.bottlePositioningDelay);
+  prefsSettings.putInt("thBottle", settings.thresholdBottleLoaded);
+  prefsSettings.putInt("thCapLoad", settings.thresholdCapLoaded);
+  prefsSettings.putInt("thCapFull", settings.thresholdCapFull);
+  prefsSettings.putInt("rollAvg", settings.rollingAverageWindow);
+  prefsSettings.end();
+}
+
+static bool tryConnectWifi(const String &ssid, const String &password, uint32_t timeoutMs)
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  Serial.print("Connecting to WiFi SSID: ");
+  Serial.println(ssid);
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs)
+  {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
+}
+
+static void startAP()
+{
+  String ssid = String("BottlingMachine-") + _getChipIdSuffix();
+  WiFi.mode(WIFI_AP_STA);
+  bool ok = WiFi.softAP(ssid.c_str());
+  Serial.print("Starting AP: ");
+  Serial.print(ssid);
+  Serial.print(" => ");
+  Serial.println(ok ? "OK" : "FAIL");
+  WiFi.softAPsetHostname(_getHostname().c_str());
+  _setupMDNS();
+}
+
+static void stopAP()
+{
+  if (WiFi.getMode() & WIFI_AP)
+  {
+    WiFi.softAPdisconnect(true);
+  }
+}
+
+static void setupNetworking()
+{
+  // Load WiFi credentials
+  prefsWifi.begin("wifi", true);
+  String ssid = prefsWifi.getString("ssid", "");
+  String pass = prefsWifi.getString("pass", "");
+  prefsWifi.end();
+
+  if (ssid.length() > 0)
+  {
+    WiFi.setHostname(_getHostname().c_str());
+    if (tryConnectWifi(ssid, pass, 15000))
+    {
+      Serial.print("WiFi connected, IP: ");
+      Serial.println(WiFi.localIP());
+      stopAP();
+      _setupMDNS();
+      return;
+    }
+  }
+  startAP();
+}
+
+static void sendJson(AsyncWebServerRequest *request, const JsonDocument &doc)
+{
+  String out;
+  serializeJson(doc, out);
+  request->send(200, "application/json", out);
+}
+
+static void serializeSettings(JsonDocument &doc)
+{
+  doc["enableFilling"] = settings.enableFilling;
+  doc["enableCapping"] = settings.enableCapping;
+  doc["pushTime"] = settings.pushTime;
+  doc["fillTime"] = settings.fillTime;
+  doc["capTime"] = settings.capTime;
+  doc["postPushDelay"] = settings.postPushDelay;
+  doc["postFillDelay"] = settings.postFillDelay;
+  doc["bottlePositioningDelay"] = settings.bottlePositioningDelay;
+  doc["thresholdBottleLoaded"] = settings.thresholdBottleLoaded;
+  doc["thresholdCapLoaded"] = settings.thresholdCapLoaded;
+  doc["thresholdCapFull"] = settings.thresholdCapFull;
+  doc["rollingAverageWindow"] = settings.rollingAverageWindow;
+}
+
+static String machineStateToString()
+{
+  switch (machineState)
+  {
+  case STATE_STOPPED:
+    return "stopped";
+  case STATE_PAUSED:
+    return "paused";
+  case STATE_RUNNING:
+    return "running";
+  }
+  return "unknown";
+}
+
+static bool parseBool(const String &v)
+{
+  if (v.equalsIgnoreCase("true") || v == "1" || v.equalsIgnoreCase("on") || v.equalsIgnoreCase("yes"))
+    return true;
+  return false;
+}
+
+static bool updateSettingByName(const String &name, const String &value)
+{
+  if (name == "enableFilling")
+  {
+    settings.enableFilling = parseBool(value);
+  }
+  else if (name == "enableCapping")
+  {
+    settings.enableCapping = parseBool(value);
+  }
+  else if (name == "pushTime")
+  {
+    settings.pushTime = value.toInt();
+  }
+  else if (name == "fillTime")
+  {
+    settings.fillTime = value.toInt();
+  }
+  else if (name == "capTime")
+  {
+    settings.capTime = value.toInt();
+  }
+  else if (name == "postPushDelay")
+  {
+    settings.postPushDelay = value.toInt();
+  }
+  else if (name == "postFillDelay")
+  {
+    settings.postFillDelay = value.toInt();
+  }
+  else if (name == "bottlePositioningDelay")
+  {
+    settings.bottlePositioningDelay = value.toInt();
+  }
+  else if (name == "thresholdBottleLoaded")
+  {
+    settings.thresholdBottleLoaded = value.toInt();
+  }
+  else if (name == "thresholdCapLoaded")
+  {
+    settings.thresholdCapLoaded = value.toInt();
+  }
+  else if (name == "thresholdCapFull")
+  {
+    settings.thresholdCapFull = value.toInt();
+  }
+  else if (name == "rollingAverageWindow")
+  {
+    int v = value.toInt();
+    if (v < 1)
+      v = 1;
+    if (v > MAX_ROLLING_AVG)
+      v = MAX_ROLLING_AVG;
+    settings.rollingAverageWindow = v;
+  }
+  else
+  {
+    return false;
+  }
+  saveSettings();
+  return true;
+}
+
+static void setupServer()
+{
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+    AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", INDEX_HTML);
+    request->send(response); });
+
+  // Preflight + dynamic routes (per-key settings)
+  server.onNotFound([](AsyncWebServerRequest *request)
+                    {
+    if (request->method() == HTTP_OPTIONS)
+    {
+      request->send(200);
+      return;
+    }
+    String url = request->url();
+    if (request->method() == HTTP_POST && url.startsWith("/api/settings/") && url.length() > 15)
+    {
+      String name = url.substring(String("/api/settings/").length());
+      String val;
+      if (request->hasParam("value", true))
+      {
+        val = request->getParam("value", true)->value();
+      }
+      else
+      {
+        val = request->arg("plain");
+      }
+      if (val.length() == 0)
+      {
+        request->send(400, "application/json", "{\"error\":\"Missing value\"}");
+        return;
+      }
+      if (!updateSettingByName(name, val))
+      {
+        request->send(404, "application/json", "{\"error\":\"Unknown setting\"}");
+        return;
+      }
+      StaticJsonDocument<256> doc;
+      doc["ok"] = true;
+      doc["name"] = name;
+      doc["value"] = val;
+      sendJson(request, doc);
+      return;
+    }
+    request->send(404, "application/json", "{\"error\":\"Not found\"}"); });
+
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+    StaticJsonDocument<256> doc;
+    bool connected = WiFi.status() == WL_CONNECTED;
+    doc["connected"] = connected;
+    doc["ip"] = connected ? WiFi.localIP().toString() : String("");
+    doc["ap"] = (WiFi.getMode() & WIFI_AP) ? WiFi.softAPSSID() : String("");
+    doc["hostname"] = _getHostname();
+    doc["mdns"] = _getHostname() + String(".local");
+    doc["machineState"] = machineStateToString();
+    sendJson(request, doc); });
+
+  server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+    StaticJsonDocument<512> doc;
+    serializeSettings(doc);
+    sendJson(request, doc); });
+
+  server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+              if (index == 0)
+              {
+                request->_tempObject = new String();
+              }
+              String *body = reinterpret_cast<String *>(request->_tempObject);
+              body->concat((const char *)data, len);
+              if (index + len == total)
+              {
+                StaticJsonDocument<512> docIn;
+                DeserializationError err = deserializeJson(docIn, *body);
+                delete body;
+                request->_tempObject = nullptr;
+                if (!err)
+                {
+                  for (JsonPair kv : docIn.as<JsonObject>())
+                  {
+                    updateSettingByName(String(kv.key().c_str()), kv.value().as<String>());
+                  }
+                  StaticJsonDocument<512> doc;
+                  serializeSettings(doc);
+                  sendJson(request, doc);
+                }
+                else
+                {
+                  request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+                }
+              } });
+
+  server.on("/api/settings/", HTTP_POST, [](AsyncWebServerRequest *request)
+            { request->send(400, "application/json", "{\"error\":\"Missing setting name\"}"); });
+
+  server.on("/api/settings", HTTP_ANY, [](AsyncWebServerRequest *request)
+            { request->send(405); });
+
+  server.on("/api/settings/", HTTP_ANY, [](AsyncWebServerRequest *request)
+            { request->send(405); });
+
+  server.on("/api/wifi", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+              if (index == 0)
+              {
+                request->_tempObject = new String();
+              }
+              String *body = reinterpret_cast<String *>(request->_tempObject);
+              body->concat((const char *)data, len);
+              if (index + len == total)
+              {
+                StaticJsonDocument<256> docIn;
+                DeserializationError err = deserializeJson(docIn, *body);
+                String ssid = docIn["ssid"].as<String>();
+                String pass = docIn["password"].as<String>();
+                delete body;
+                request->_tempObject = nullptr;
+                bool connected = false;
+                String ip = "";
+                if (!err && ssid.length() > 0)
+                {
+                  connected = tryConnectWifi(ssid, pass, 15000);
+                  if (connected)
+                  {
+                    prefsWifi.begin("wifi", false);
+                    prefsWifi.putString("ssid", ssid);
+                    prefsWifi.putString("pass", pass);
+                    prefsWifi.end();
+                    stopAP();
+                    ip = WiFi.localIP().toString();
+                    _setupMDNS();
+                  }
+                }
+                StaticJsonDocument<256> doc;
+                doc["connected"] = connected;
+                doc["ip"] = ip;
+                sendJson(request, doc);
+              } });
+
+  server.on("/api/control", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+              if (index == 0)
+              {
+                request->_tempObject = new String();
+              }
+              String *body = reinterpret_cast<String *>(request->_tempObject);
+              body->concat((const char *)data, len);
+              if (index + len == total)
+              {
+                StaticJsonDocument<128> docIn;
+                DeserializationError err = deserializeJson(docIn, *body);
+                delete body;
+                request->_tempObject = nullptr;
+                if (!err)
+                {
+                  String action = docIn["action"].as<String>();
+                  if (action == "start")
+                  {
+                    machineState = STATE_RUNNING;
+                  }
+                  else if (action == "pause")
+                  {
+                    machineState = STATE_PAUSED;
+                    _applySafeOutputs();
+                  }
+                  else if (action == "stop")
+                  {
+                    machineState = STATE_STOPPED;
+                    _applySafeOutputs();
+                  }
+                  StaticJsonDocument<128> doc;
+                  doc["machineState"] = machineStateToString();
+                  sendJson(request, doc);
+                }
+                else
+                {
+                  request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+                }
+              } });
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+// 🧮 Calculate mean of the last N readings from a circular buffer
+float _calculateMean(const float *readings, int bufferSize, int lastN, int endIndex)
+{
+  if (lastN <= 0)
+  {
+    return 0;
+  }
+  float sum = 0;
+  for (int i = 0; i < lastN; i++)
+  {
+    int idx = (endIndex - 1 - i + bufferSize) % bufferSize;
+    sum += readings[idx];
+  }
+  return sum / lastN;
 }
 
 void setup()
 {
   // Initialize serial communication for debugging
   Serial.begin(115200);
+
+  loadSettings();
+  setupNetworking();
 
   pinMode(conveyorPin, OUTPUT);
   pinMode(capLoaderPin, OUTPUT);
@@ -63,6 +718,8 @@ void setup()
   pinMode(echoPinCapLoaded, INPUT);
 
   Serial.println("Pin setup complete");
+
+  setupServer();
 }
 
 float _getRawUltrasonicSensorReading(int triggerPin, int echoPin)
@@ -76,7 +733,7 @@ float _getRawUltrasonicSensorReading(int triggerPin, int echoPin)
 // 🎯 UNIVERSAL SENSOR BUFFER SYSTEM: Map-like structure for per-pin rolling averages
 struct SensorBuffer
 {
-  float readings[rollingAverageCount];
+  float readings[MAX_ROLLING_AVG];
   int readingIndex;
   int totalReadingCount;
 };
@@ -104,7 +761,7 @@ SensorBuffer *_getSensorBuffer(int triggerPin)
     registeredPins[bufferCount] = triggerPin;
     SensorBuffer *newBuffer = &sensorBuffers[bufferCount];
     // 🛡️ BUFFER INITIALIZATION: Zero out new buffer
-    for (int i = 0; i < rollingAverageCount; i++)
+    for (int i = 0; i < MAX_ROLLING_AVG; i++)
     {
       newBuffer->readings[i] = 0;
     }
@@ -128,17 +785,26 @@ float _getUltrasonicSensorDistance(int triggerPin, int echoPin)
 
   // 💾 TACTICAL DATA STORAGE: Store reading in pin-specific circular buffer
   buffer->readings[buffer->readingIndex] = rawDistance;
-  buffer->readingIndex = (buffer->readingIndex + 1) % rollingAverageCount;
+  buffer->readingIndex = (buffer->readingIndex + 1) % MAX_ROLLING_AVG;
   buffer->totalReadingCount++;
 
-  // 🎯 INITIALIZATION PROTOCOL: Return default for first rollingAverageCount readings
-  if (buffer->totalReadingCount < rollingAverageCount)
+  // 🎯 INITIALIZATION PROTOCOL: Return default for first settings.rollingAverageWindow readings
+  if (buffer->totalReadingCount < settings.rollingAverageWindow)
   {
     return 1000; // 🛡️ BUFFER WARMING: Return safe default until buffer full
   }
 
-  // ⚡ MEAN CALCULATION: Return average of last rollingAverageCount readings for this specific pin
-  float mean = _calculateMean(buffer->readings, rollingAverageCount);
+  // ⚡ MEAN CALCULATION: Return average of last rollingAverageWindow readings for this specific pin
+  int window = settings.rollingAverageWindow;
+  if (window < 1)
+  {
+    window = 1;
+  }
+  if (window > MAX_ROLLING_AVG)
+  {
+    window = MAX_ROLLING_AVG;
+  }
+  float mean = _calculateMean(buffer->readings, MAX_ROLLING_AVG, window, buffer->readingIndex);
   if (mean < 0.01)
   {
     return 1000;
@@ -154,7 +820,7 @@ float getBottleDistance()
 float getCapLoadedDistance()
 {
   // 🔧 OPERATION CHECK: Return safe distance when capping is disabled
-  if (!enableCapping)
+  if (!settings.enableCapping)
   {
     return 50; // Return distance indicating cap is loaded
   }
@@ -163,7 +829,7 @@ float getCapLoadedDistance()
 float getCapFullDistance()
 {
   // 🔧 OPERATION CHECK: Return safe distance when capping is disabled
-  if (!enableCapping)
+  if (!settings.enableCapping)
   {
     return 50; // Return distance indicating cap loader is full
   }
@@ -173,19 +839,19 @@ float getCapFullDistance()
 bool isCapLoaded()
 {
   // 🔧 OPERATION CHECK: Assume cap is always loaded when capping is disabled
-  if (!enableCapping)
+  if (!settings.enableCapping)
   {
     Serial.println("🚫 CAPPING DISABLED: Assuming cap is loaded");
     digitalWrite(capLoaderPin, LOW); // Stop cap loader when capping disabled
     return true;
   }
 
-  const int maxDistance = 160;
+  const int maxDistance = settings.thresholdCapLoaded;
   float capLoadedDistance = getCapLoadedDistance();
   float capFullDistance = getCapFullDistance();
 
   bool isCapLoaded = capLoadedDistance < maxDistance;
-  bool isCapFull = capFullDistance < maxDistance;
+  bool isCapFull = capFullDistance < settings.thresholdCapFull;
 
   if (!isCapFull)
   {
@@ -214,7 +880,7 @@ bool isCapLoaded()
 
 bool isBottleLoaded()
 {
-  const int maxDistance = 200;
+  const int maxDistance = settings.thresholdBottleLoaded;
   float distance = getBottleDistance();
 
   if (distance < maxDistance)
@@ -256,7 +922,7 @@ void loadBottle()
 void capBottle()
 {
   // 🔧 OPERATION CHECK: Skip if capping is disabled
-  if (!enableCapping)
+  if (!settings.enableCapping)
   {
     Serial.println("🚫 CAPPING DISABLED: Skipping cap sequence");
     return;
@@ -276,7 +942,7 @@ void capBottle()
   Serial.println("⚡ CAP MECHANISM: Activated for 2 seconds");
 
   // ⏱️ TIMED OPERATION: Maintain cap for precise duration
-  delay(capTime);
+  delay(settings.capTime);
 
   // 🛡️ MISSION COMPLETE: Deactivate cap mechanism
   digitalWrite(capPin, LOW);
@@ -298,9 +964,9 @@ void pushBottle()
   // 🎯 BOTTLE POSITIONING: Keep conveyor running to position bottle properly
   digitalWrite(conveyorPin, HIGH);
   Serial.print("🎯 BOTTLE POSITIONING: Conveyor running for ");
-  Serial.print(bottlePositioningDelay / 1000.0);
+  Serial.print(settings.bottlePositioningDelay / 1000.0);
   Serial.println(" seconds to position bottle");
-  delay(bottlePositioningDelay);
+  delay(settings.bottlePositioningDelay);
 
   // 🛑 CONVEYOR STOP: Ensure conveyor is stopped during push operation
   digitalWrite(conveyorPin, LOW);
@@ -309,11 +975,11 @@ void pushBottle()
   // 🎯 TACTICAL ENGAGEMENT: Activate push mechanism
   digitalWrite(pushRegisterPin, HIGH);
   Serial.print("⚡ PUSH MECHANISM: Activated for ");
-  Serial.print(pushTime / 1000.0);
+  Serial.print(settings.pushTime / 1000.0);
   Serial.println(" seconds");
 
   // ⏱️ TIMED OPERATION: Maintain push for precise duration
-  delay(pushTime);
+  delay(settings.pushTime);
 
   // 🛡️ MISSION COMPLETE: Deactivate push mechanism
   digitalWrite(pushRegisterPin, LOW);
@@ -321,9 +987,9 @@ void pushBottle()
 
   // ⏳ POST-PUSH DELAY: Wait before resuming operations
   Serial.print("⏳ POST-PUSH DELAY: Waiting ");
-  Serial.print(postPushDelay / 1000.0);
+  Serial.print(settings.postPushDelay / 1000.0);
   Serial.println(" seconds before resuming operations");
-  delay(postPushDelay);
+  delay(settings.postPushDelay);
   Serial.println("✅ POST-PUSH DELAY COMPLETE: Resuming operations");
 
   capBottle();
@@ -332,7 +998,7 @@ void pushBottle()
 void fillBottle()
 {
   // 🔧 OPERATION CHECK: Skip if filling is disabled
-  if (!enableFilling)
+  if (!settings.enableFilling)
   {
     Serial.println("🚫 FILLING DISABLED: Skipping fill sequence");
     return;
@@ -350,11 +1016,11 @@ void fillBottle()
   // 🎯 TACTICAL ENGAGEMENT: Activate fill mechanism
   digitalWrite(fillPin, HIGH);
   Serial.print("⚡ FILL MECHANISM: Activated for ");
-  Serial.print(fillTime / 1000.0);
+  Serial.print(settings.fillTime / 1000.0);
   Serial.println(" seconds");
 
   // ⏱️ TIMED OPERATION: Maintain fill for precise duration
-  delay(fillTime);
+  delay(settings.fillTime);
 
   // 🛡️ MISSION COMPLETE: Deactivate fill mechanism
   digitalWrite(fillPin, LOW);
@@ -362,133 +1028,52 @@ void fillBottle()
 
   // ⏳ POST-FILL DELAY: Wait before next push operation
   Serial.print("⏳ POST-FILL DELAY: Waiting ");
-  Serial.print(postFillDelay / 1000.0);
+  Serial.print(settings.postFillDelay / 1000.0);
   Serial.println(" seconds before next operation");
-  delay(postFillDelay);
+  delay(settings.postFillDelay);
   Serial.println("✅ POST-FILL DELAY COMPLETE: Ready for next operation");
 }
 
-// State management
-// int currentAction = 1;
-
-// void loop()
-// {
-//   // 🔍 SENSOR RECONNAISSANCE: Gather distance intelligence from both sensors
-//   float bottleDistance = getBottleDistance();
-//   float capDistance = getCapLoadedDistance();
-
-//   bool isCapLoadedValue = isCapLoaded();
-//   bool isBottleLoadedValue = isBottleLoaded();
-
-//   // 📡 TACTICAL COMMUNICATION: Report sensor data to command center
-//   Serial.print("Bottle Distance: ");
-//   Serial.print(bottleDistance);
-//   Serial.print(" | Cap Distance: ");
-//   Serial.println(capDistance);
-
-//   if (isCapLoadedValue == false)
-//   {
-//     Serial.println("⚔️ CAP NOT LOADED: Activating cap loader");
-//     digitalWrite(capLoaderPin, HIGH);
-//   }
-//   else
-//   {
-//     digitalWrite(capLoaderPin, LOW);
-//   }
-
-//   if (isBottleLoadedValue == false)
-//   {
-//     Serial.println("⚔️ BOTTLE NOT LOADED: Activating conveyor");
-//     digitalWrite(conveyorPin, HIGH);
-//   }
-//   else
-//   {
-//     digitalWrite(conveyorPin, LOW);
-//   }
-
-//   if (currentAction == 1)
-//   {
-//     for (int i = 0; i < 3; i++)
-//     {
-//       while (isBottleLoaded() == false)
-//       {
-//         isCapLoaded(); // Stop the capper if we are waiting on bottle
-//         delay(50);
-//       }
-//       pushBottle();
-//     }
-//     currentAction = 2;
-//   }
-//   else if (currentAction == 2)
-//   {
-//     fillBottle();
-//     currentAction = 3;
-//   }
-//   else if (currentAction == 3)
-//   {
-//     while (isBottleLoaded() != true)
-//     {
-//       isCapLoaded(); // Stop the capper if we are waiting on bottle
-//       delay(50);
-//     }
-//     pushBottle();
-//     currentAction = 4;
-//   }
-//   else if (currentAction == 4)
-//   {
-//     fillBottle();
-//     currentAction = 5;
-//   }
-//   else if (currentAction == 5)
-//   {
-//     while (isBottleLoaded() != true && isCapLoaded() != true)
-//     {
-//       delay(50);
-//     }
-//     pushBottle();
-//     pushBottle();
-//     currentAction = 6;
-//   }
-//   else if (currentAction == 6)
-//   {
-//     while (isCapLoaded() != true)
-//     {
-//       isBottleLoaded(); // Stop the conveyor if we are waiting on cap
-//       delay(50);
-//     }
-//     fillBottle();
-//     currentAction = 1;
-//   }
-//   delay(50);
-// }
-
-// Double filler sequence
-
-// 1. Push 3 bottles
-// 2. Fill bottle
-// 3. Push bottle
-// 4. Fill bottle
-
 void loop()
 {
-  while (isBottleLoaded() == false || isCapLoaded() == false)
+  if (machineState == STATE_STOPPED)
+  {
+    delay(100);
+    return;
+  }
+  if (machineState == STATE_PAUSED)
+  {
+    // Keep safety outputs applied while paused
+    _applySafeOutputs();
+    delay(100);
+    return;
+  }
+
+  // STATE_RUNNING
+  while ((isBottleLoaded() == false || isCapLoaded() == false) && machineState == STATE_RUNNING)
   {
     delay(50);
+  }
+  if (machineState != STATE_RUNNING)
+  {
+    return;
   }
   pushBottle();
   pushBottle();
   pushBottle();
 
-  // Conditionally fill bottle if filling is enabled
-  if (enableFilling)
+  if (settings.enableFilling && machineState == STATE_RUNNING)
   {
     fillBottle();
   }
 
+  if (machineState != STATE_RUNNING)
+  {
+    return;
+  }
   pushBottle();
 
-  // Conditionally fill bottle again if filling is enabled
-  if (enableFilling)
+  if (settings.enableFilling && machineState == STATE_RUNNING)
   {
     fillBottle();
   }
