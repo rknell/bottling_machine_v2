@@ -5,6 +5,7 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
+#include <LittleFS.h>
 
 // ===== Settings (persisted) =====
 struct Settings
@@ -142,6 +143,7 @@ static bool _waitWithAbort(uint32_t durationMs)
   return true;
 }
 
+/* INDEX_HTML moved to LittleFS: /data/index.html */
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html>
 <html>
@@ -541,10 +543,7 @@ static void setupServer()
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-            {
-    AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", INDEX_HTML);
-    request->send(response); });
+  server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
 
   // Preflight + dynamic routes (per-key settings)
   server.onNotFound([](AsyncWebServerRequest *request)
@@ -746,6 +745,12 @@ void setup()
 {
   // Initialize serial communication for debugging
   Serial.begin(115200);
+
+  // Mount LittleFS for serving static assets
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("LittleFS mount failed");
+  }
 
   loadSettings();
   setupNetworking();
